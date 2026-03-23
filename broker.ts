@@ -10,6 +10,7 @@
  */
 
 import { Database } from "bun:sqlite";
+import type { ServerWebSocket } from "bun";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -264,13 +265,21 @@ function handleListPeers(body: ListPeersRequest): Peer[] {
 }
 
 function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: string } {
-  // Verify target exists
   const target = db.query("SELECT id FROM peers WHERE id = ?").get(body.to_id) as { id: string } | null;
-  if (!target) {
-    return { ok: false, error: `Peer ${body.to_id} not found` };
-  }
+  if (!target) return { ok: false, error: `Peer ${body.to_id} not found` };
 
-  insertMessage.run(body.from_id, body.to_id, body.text, new Date().toISOString());
+  const now = new Date().toISOString();
+  const result = insertMessage.run(body.from_id, body.to_id, body.text, now);
+  const msgId = result.lastInsertRowid as number;
+
+  // Push over WebSocket immediately if target is connected
+  const pushed = wsPush(body.to_id, {
+    type: "dm",
+    message: { id: msgId, from_id: body.from_id, to_id: body.to_id, text: body.text, sent_at: now },
+  });
+  // Mark delivered immediately if pushed over WS (avoids double-delivery via poll)
+  if (pushed) markDelivered.run(msgId);
+
   return { ok: true };
 }
 
@@ -335,9 +344,33 @@ function handlePostToRoom(body: PostToRoomRequest): PostToRoomResponse {
   const member = db.query("SELECT 1 FROM room_members WHERE room_id = ? AND peer_id = ?").get(body.room_id, body.from_id);
   if (!member) return { ok: false, error: "Not a member of this room" };
 
+  const now = new Date().toISOString();
   const result = db.run("INSERT INTO room_messages (room_id, from_id, text, sent_at) VALUES (?, ?, ?, ?)",
-    [body.room_id, body.from_id, body.text, new Date().toISOString()]);
-  return { ok: true, message_id: result.lastInsertRowid as number };
+    [body.room_id, body.from_id, body.text, now]);
+  const msgId = result.lastInsertRowid as number;
+
+  // Get room name and all members for push
+  const room = db.query("SELECT name FROM rooms WHERE id = ?").get(body.room_id) as { name: string } | null;
+  const members = db.query("SELECT peer_id FROM room_members WHERE room_id = ?")
+    .all(body.room_id) as { peer_id: string }[];
+
+  const payload = {
+    type: "room_message",
+    message: { id: msgId, room_id: body.room_id, room_name: room?.name ?? "", from_id: body.from_id, text: body.text, sent_at: now },
+  };
+
+  // Push to all connected members and advance their last_read_id
+  for (const { peer_id } of members) {
+    if (peer_id === body.from_id) continue; // don't echo back to sender
+    const pushed = wsPush(peer_id, payload);
+    if (pushed) {
+      // Advance cursor so HTTP poll fallback doesn't re-deliver
+      db.run("UPDATE room_members SET last_read_id = ? WHERE room_id = ? AND peer_id = ?",
+        [msgId, body.room_id, peer_id]);
+    }
+  }
+
+  return { ok: true, message_id: msgId };
 }
 
 function handleListRooms(body: ListRoomsRequest): ListRoomsResponse {
@@ -391,6 +424,23 @@ function handlePollRoomMessages(body: PollRoomMessagesRequest): PollRoomMessages
   return { messages: allMessages };
 }
 
+// --- WebSocket client registry ---
+
+interface WSData { peerId: string | null }
+const wsClients = new Map<string, ServerWebSocket<WSData>>();
+
+function wsPush(peerId: string, payload: unknown): boolean {
+  const ws = wsClients.get(peerId);
+  if (!ws) return false;
+  try {
+    ws.send(JSON.stringify(payload));
+    return true;
+  } catch {
+    wsClients.delete(peerId);
+    return false;
+  }
+}
+
 // Periodically prune room messages older than 24h
 setInterval(() => {
   db.run("DELETE FROM room_messages WHERE sent_at < datetime('now', '-24 hours')");
@@ -398,16 +448,22 @@ setInterval(() => {
 
 // --- HTTP Server ---
 
-Bun.serve({
+Bun.serve<WSData>({
   port: PORT,
   hostname: HOST,
-  async fetch(req) {
+  async fetch(req, server) {
     const url = new URL(req.url);
     const path = url.pathname;
 
+    // WebSocket upgrade
+    if (path === "/ws" && req.headers.get("upgrade") === "websocket") {
+      const ok = server.upgrade(req, { data: { peerId: null } });
+      return ok ? undefined : new Response("WebSocket upgrade failed", { status: 400 });
+    }
+
     if (req.method !== "POST") {
       if (path === "/health") {
-        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length });
+        return Response.json({ status: "ok", peers: (selectAllPeers.all() as Peer[]).length, ws_clients: wsClients.size });
       }
       return new Response("claude-multiplayer broker", { status: 200 });
     }
@@ -453,6 +509,24 @@ Bun.serve({
       const msg = e instanceof Error ? e.message : String(e);
       return Response.json({ error: msg }, { status: 500 });
     }
+  },
+  websocket: {
+    open(ws) {
+      ws.data = { peerId: null };
+    },
+    message(ws, raw) {
+      try {
+        const msg = JSON.parse(raw as string);
+        if (msg.type === "auth" && msg.peer_id) {
+          ws.data.peerId = msg.peer_id;
+          wsClients.set(msg.peer_id, ws);
+          ws.send(JSON.stringify({ type: "auth_ok", peer_id: msg.peer_id }));
+        }
+      } catch { /* ignore malformed */ }
+    },
+    close(ws) {
+      if (ws.data?.peerId) wsClients.delete(ws.data.peerId);
+    },
   },
 });
 

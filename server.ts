@@ -41,8 +41,9 @@ import {
 
 const BROKER_PORT = parseInt(process.env.CLAUDE_MULTIPLAYER_PORT ?? "7899", 10);
 const BROKER_URL = process.env.CLAUDE_MULTIPLAYER_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_WS_URL = BROKER_URL.replace(/^http/, "ws") + "/ws";
 const IS_REMOTE = !!process.env.CLAUDE_MULTIPLAYER_BROKER;
-const POLL_INTERVAL_MS = 1000;
+const POLL_INTERVAL_MS = 10_000; // fallback poll — WS handles real-time delivery
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
 
@@ -541,74 +542,99 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
   }
 });
 
-// --- Polling loop for inbound messages ---
+// --- Notification helpers ---
+
+async function pushDm(msg: { id: number; from_id: string; to_id: string; text: string; sent_at: string }) {
+  let fromSummary = "", fromCwd = "";
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+    const sender = peers.find((p) => p.id === msg.from_id);
+    if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+  } catch { /* non-critical */ }
+
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content: msg.text,
+      meta: { type: "direct_message", from_id: msg.from_id, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
+    },
+  });
+  log(`DM from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+}
+
+async function pushRoomMessage(msg: RoomMessage) {
+  if (msg.from_id === myId) return; // don't echo own messages
+
+  let fromSummary = "", fromCwd = "";
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+    const sender = peers.find((p) => p.id === msg.from_id);
+    if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+  } catch { /* non-critical */ }
+
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content: `[#${msg.room_name}] ${msg.text}`,
+      meta: { type: "room_message", room_id: msg.room_id, room_name: msg.room_name, from_id: msg.from_id, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
+    },
+  });
+  log(`Room #${msg.room_name} from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+}
+
+// --- WebSocket connection to broker ---
+
+let brokerWs: WebSocket | null = null;
+let wsReady = false;
+
+function connectBrokerWs() {
+  if (!myId) return;
+  log(`Connecting WebSocket to ${BROKER_WS_URL}...`);
+
+  const ws = new WebSocket(BROKER_WS_URL);
+  brokerWs = ws;
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: "auth", peer_id: myId }));
+  };
+
+  ws.onmessage = async (event) => {
+    try {
+      const data = JSON.parse(event.data as string);
+      if (data.type === "auth_ok") {
+        wsReady = true;
+        log(`WebSocket ready (peer ${data.peer_id})`);
+      } else if (data.type === "dm") {
+        await pushDm(data.message);
+      } else if (data.type === "room_message") {
+        await pushRoomMessage(data.message);
+      }
+    } catch (e) {
+      log(`WS message error: ${e instanceof Error ? e.message : String(e)}`);
+    }
+  };
+
+  ws.onclose = () => {
+    wsReady = false;
+    brokerWs = null;
+    log("WebSocket closed, reconnecting in 3s...");
+    setTimeout(connectBrokerWs, 3000);
+  };
+
+  ws.onerror = () => ws.close();
+}
+
+// --- Fallback poll (runs every 10s to catch anything missed during WS downtime) ---
 
 async function pollAndPushMessages() {
   if (!myId) return;
-
   try {
-    // Poll DMs and room messages in parallel
     const [dmResult, roomResult] = await Promise.all([
       brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId }),
       brokerFetch<PollRoomMessagesResponse>("/poll-room-messages", { peer_id: myId }),
     ]);
-
-    // --- Direct messages ---
-    for (const msg of dmResult.messages) {
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
-      } catch { /* non-critical */ }
-
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            type: "direct_message",
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
-      });
-      log(`DM from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
-    }
-
-    // --- Room messages ---
-    for (const msg of roomResult.messages) {
-      // Don't notify about our own messages
-      if (msg.from_id === myId) continue;
-
-      let fromSummary = "";
-      let fromCwd = "";
-      try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
-        const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
-      } catch { /* non-critical */ }
-
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: `[#${msg.room_name}] ${msg.text}`,
-          meta: {
-            type: "room_message",
-            room_id: msg.room_id,
-            room_name: msg.room_name,
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
-          },
-        },
-      });
-      log(`Room #${msg.room_name} from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
-    }
+    for (const msg of dmResult.messages) await pushDm(msg);
+    for (const msg of roomResult.messages) await pushRoomMessage(msg);
   } catch (e) {
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
   }
@@ -670,6 +696,9 @@ async function main() {
   });
   myId = reg.id;
   log(`Registered as peer ${myId}`);
+
+  // Connect WebSocket for real-time push delivery
+  connectBrokerWs();
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
