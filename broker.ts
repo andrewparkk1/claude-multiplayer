@@ -21,6 +21,20 @@ import type {
   PollMessagesResponse,
   Peer,
   Message,
+  Room,
+  RoomWithMeta,
+  RoomMessage,
+  CreateRoomRequest,
+  CreateRoomResponse,
+  JoinRoomRequest,
+  JoinRoomResponse,
+  LeaveRoomRequest,
+  PostToRoomRequest,
+  PostToRoomResponse,
+  ListRoomsRequest,
+  ListRoomsResponse,
+  PollRoomMessagesRequest,
+  PollRoomMessagesResponse,
 } from "./shared/types.ts";
 
 const PORT = parseInt(process.env.CLAUDE_MULTIPLAYER_PORT ?? "7899", 10);
@@ -56,6 +70,36 @@ db.run(`
     delivered INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (from_id) REFERENCES peers(id),
     FOREIGN KEY (to_id) REFERENCES peers(id)
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    topic TEXT NOT NULL DEFAULT '',
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS room_members (
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    peer_id TEXT NOT NULL,
+    joined_at TEXT NOT NULL,
+    last_read_id INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (room_id, peer_id)
+  )
+`);
+
+db.run(`
+  CREATE TABLE IF NOT EXISTS room_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+    from_id TEXT NOT NULL,
+    text TEXT NOT NULL,
+    sent_at TEXT NOT NULL
   )
 `);
 
@@ -245,6 +289,113 @@ function handleUnregister(body: { id: string }): void {
   deletePeer.run(body.id);
 }
 
+// --- Room handlers ---
+
+function handleCreateRoom(body: CreateRoomRequest): CreateRoomResponse {
+  if (!/^[a-z0-9][a-z0-9-_]{0,39}$/.test(body.name)) {
+    return { ok: false, error: "Room name must be lowercase letters, numbers, hyphens or underscores (max 40 chars)" };
+  }
+  const existing = db.query("SELECT id FROM rooms WHERE name = ?").get(body.name);
+  if (existing) return { ok: false, error: `Room "${body.name}" already exists` };
+
+  const id = generateId();
+  const now = new Date().toISOString();
+  db.run("INSERT INTO rooms (id, name, topic, created_by, created_at) VALUES (?, ?, ?, ?, ?)",
+    [id, body.name, body.topic ?? "", body.peer_id, now]);
+  db.run("INSERT INTO room_members (room_id, peer_id, joined_at, last_read_id) VALUES (?, ?, ?, 0)",
+    [id, body.peer_id, now]);
+
+  const room = db.query("SELECT * FROM rooms WHERE id = ?").get(id) as Room;
+  return { ok: true, room };
+}
+
+function handleJoinRoom(body: JoinRoomRequest): JoinRoomResponse {
+  const room = db.query("SELECT * FROM rooms WHERE name = ?").get(body.room_name) as Room | null;
+  if (!room) return { ok: false, error: `Room "${body.room_name}" not found` };
+
+  const already = db.query("SELECT 1 FROM room_members WHERE room_id = ? AND peer_id = ?").get(room.id, body.peer_id);
+  if (already) return { ok: false, error: "Already a member" };
+
+  const maxId = (db.query("SELECT MAX(id) as m FROM room_messages WHERE room_id = ?").get(room.id) as { m: number | null }).m ?? 0;
+  db.run("INSERT INTO room_members (room_id, peer_id, joined_at, last_read_id) VALUES (?, ?, ?, ?)",
+    [room.id, body.peer_id, new Date().toISOString(), maxId]);
+
+  return { ok: true, room };
+}
+
+function handleLeaveRoom(body: LeaveRoomRequest): { ok: boolean } {
+  db.run("DELETE FROM room_members WHERE room_id = ? AND peer_id = ?", [body.room_id, body.peer_id]);
+  // Delete room if empty
+  const count = (db.query("SELECT COUNT(*) as c FROM room_members WHERE room_id = ?").get(body.room_id) as { c: number }).c;
+  if (count === 0) db.run("DELETE FROM rooms WHERE id = ?", [body.room_id]);
+  return { ok: true };
+}
+
+function handlePostToRoom(body: PostToRoomRequest): PostToRoomResponse {
+  const member = db.query("SELECT 1 FROM room_members WHERE room_id = ? AND peer_id = ?").get(body.room_id, body.from_id);
+  if (!member) return { ok: false, error: "Not a member of this room" };
+
+  const result = db.run("INSERT INTO room_messages (room_id, from_id, text, sent_at) VALUES (?, ?, ?, ?)",
+    [body.room_id, body.from_id, body.text, new Date().toISOString()]);
+  return { ok: true, message_id: result.lastInsertRowid as number };
+}
+
+function handleListRooms(body: ListRoomsRequest): ListRoomsResponse {
+  let rooms: RoomWithMeta[];
+  if (body.peer_id) {
+    rooms = db.query(`
+      SELECT r.*, COUNT(DISTINCT rm2.peer_id) as member_count,
+             MAX(msg.sent_at) as last_message_at
+      FROM rooms r
+      JOIN room_members rm ON rm.room_id = r.id AND rm.peer_id = ?
+      LEFT JOIN room_members rm2 ON rm2.room_id = r.id
+      LEFT JOIN room_messages msg ON msg.room_id = r.id
+      GROUP BY r.id
+    `).all(body.peer_id) as RoomWithMeta[];
+  } else {
+    rooms = db.query(`
+      SELECT r.*, COUNT(DISTINCT rm.peer_id) as member_count,
+             MAX(msg.sent_at) as last_message_at
+      FROM rooms r
+      LEFT JOIN room_members rm ON rm.room_id = r.id
+      LEFT JOIN room_messages msg ON msg.room_id = r.id
+      GROUP BY r.id
+    `).all() as RoomWithMeta[];
+  }
+  return { rooms };
+}
+
+function handlePollRoomMessages(body: PollRoomMessagesRequest): PollRoomMessagesResponse {
+  const memberships = db.query("SELECT room_id, last_read_id FROM room_members WHERE peer_id = ?")
+    .all(body.peer_id) as { room_id: string; last_read_id: number }[];
+
+  const allMessages: RoomMessage[] = [];
+
+  for (const m of memberships) {
+    const msgs = db.query(`
+      SELECT rm.*, r.name as room_name
+      FROM room_messages rm
+      JOIN rooms r ON r.id = rm.room_id
+      WHERE rm.room_id = ? AND rm.id > ?
+      ORDER BY rm.id ASC
+    `).all(m.room_id, m.last_read_id) as RoomMessage[];
+
+    if (msgs.length > 0) {
+      allMessages.push(...msgs);
+      const maxId = msgs[msgs.length - 1].id;
+      db.run("UPDATE room_members SET last_read_id = ? WHERE room_id = ? AND peer_id = ?",
+        [maxId, m.room_id, body.peer_id]);
+    }
+  }
+
+  return { messages: allMessages };
+}
+
+// Periodically prune room messages older than 24h
+setInterval(() => {
+  db.run("DELETE FROM room_messages WHERE sent_at < datetime('now', '-24 hours')");
+}, 60_000);
+
 // --- HTTP Server ---
 
 Bun.serve({
@@ -282,6 +433,19 @@ Bun.serve({
         case "/unregister":
           handleUnregister(body as { id: string });
           return Response.json({ ok: true });
+        case "/create-room":
+          return Response.json(handleCreateRoom(body as CreateRoomRequest));
+        case "/join-room":
+          return Response.json(handleJoinRoom(body as JoinRoomRequest));
+        case "/leave-room":
+          handleLeaveRoom(body as LeaveRoomRequest);
+          return Response.json({ ok: true });
+        case "/post-to-room":
+          return Response.json(handlePostToRoom(body as PostToRoomRequest));
+        case "/list-rooms":
+          return Response.json(handleListRooms(body as ListRoomsRequest));
+        case "/poll-room-messages":
+          return Response.json(handlePollRoomMessages(body as PollRoomMessagesRequest));
         default:
           return Response.json({ error: "not found" }, { status: 404 });
       }

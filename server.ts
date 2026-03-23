@@ -25,6 +25,11 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
   Message,
+  RoomMessage,
+  PollRoomMessagesResponse,
+  CreateRoomResponse,
+  JoinRoomResponse,
+  ListRoomsResponse,
 } from "./shared/types.ts";
 import {
   generateSummary,
@@ -149,19 +154,29 @@ const mcp = new Server(
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-multiplayer network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-multiplayer network. Claude Code instances can discover each other, send direct messages, and join group chat rooms.
 
-IMPORTANT: When you receive a <channel source="claude-multiplayer" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-multiplayer" ...> message, RESPOND IMMEDIATELY. Pause what you are doing, reply, then resume your work.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+For DIRECT MESSAGES (meta.type === "direct_message" or no type):
+- Reply with send_message using the from_id in meta
+
+For ROOM MESSAGES (meta.type === "room_message"):
+- Reply with post_to_room using the room_id in meta
+- Your reply will be seen by everyone in the room
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
-- set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
-- check_messages: Manually check for new messages
+- send_message: Send a direct message to another instance by ID
+- set_summary: Set a 1-2 sentence summary of what you're working on
+- check_messages: Manually check for new direct messages
+- create_room: Create a named group chat room
+- join_room: Join an existing room by name
+- leave_room: Leave a room
+- post_to_room: Post a message to a room (seen by all members)
+- list_rooms: List rooms you're in (or all rooms)
 
-When you start, proactively call set_summary to describe what you're working on. This helps other instances understand your context.`,
+When you start, proactively call set_summary to describe what you're working on.`,
   }
 );
 
@@ -226,6 +241,66 @@ const TOOLS = [
     inputSchema: {
       type: "object" as const,
       properties: {},
+    },
+  },
+  {
+    name: "create_room",
+    description: "Create a named group chat room. Everyone who joins will see all messages posted to the room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        name: { type: "string" as const, description: "Room name (lowercase letters, numbers, hyphens, underscores)" },
+        topic: { type: "string" as const, description: "Optional topic or description" },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "join_room",
+    description: "Join an existing group chat room by name.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_name: { type: "string" as const, description: "The room name to join" },
+      },
+      required: ["room_name"],
+    },
+  },
+  {
+    name: "leave_room",
+    description: "Leave a group chat room.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: { type: "string" as const, description: "The room ID to leave (from list_rooms)" },
+      },
+      required: ["room_id"],
+    },
+  },
+  {
+    name: "post_to_room",
+    description: "Post a message to a group chat room. All members will receive it instantly.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        room_id: { type: "string" as const, description: "The room ID to post to" },
+        message: { type: "string" as const, description: "The message to post" },
+      },
+      required: ["room_id", "message"],
+    },
+  },
+  {
+    name: "list_rooms",
+    description: "List group chat rooms.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        filter: {
+          type: "string" as const,
+          enum: ["mine", "all"],
+          description: '"mine" = rooms you are in (default), "all" = all rooms on this broker',
+        },
+      },
     },
   },
 ];
@@ -395,6 +470,72 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
       }
     }
 
+    case "create_room": {
+      const { name, topic } = args as { name: string; topic?: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      try {
+        const result = await brokerFetch<CreateRoomResponse>("/create-room", { peer_id: myId, name, topic });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Room created! Name: #${result.room!.name}  ID: ${result.room!.id}\nShare the room name with others so they can join_room.` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "join_room": {
+      const { room_name } = args as { room_name: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      try {
+        const result = await brokerFetch<JoinRoomResponse>("/join-room", { peer_id: myId, room_name });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: `Joined #${result.room!.name} (ID: ${result.room!.id})${result.room!.topic ? `\nTopic: ${result.room!.topic}` : ""}` }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "leave_room": {
+      const { room_id } = args as { room_id: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      try {
+        await brokerFetch("/leave-room", { peer_id: myId, room_id });
+        return { content: [{ type: "text" as const, text: "Left the room." }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "post_to_room": {
+      const { room_id, message } = args as { room_id: string; message: string };
+      if (!myId) return { content: [{ type: "text" as const, text: "Not registered yet" }], isError: true };
+      try {
+        const result = await brokerFetch<{ ok: boolean; error?: string }>("/post-to-room", { from_id: myId, room_id, text: message });
+        if (!result.ok) return { content: [{ type: "text" as const, text: `Failed: ${result.error}` }], isError: true };
+        return { content: [{ type: "text" as const, text: "Message posted to room." }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
+    case "list_rooms": {
+      const { filter = "mine" } = (args ?? {}) as { filter?: "mine" | "all" };
+      try {
+        const result = await brokerFetch<{ rooms: Array<{ id: string; name: string; topic: string; member_count: number; last_message_at: string | null }> }>(
+          "/list-rooms", filter === "mine" && myId ? { peer_id: myId } : {}
+        );
+        if (result.rooms.length === 0) return { content: [{ type: "text" as const, text: `No rooms found (filter: ${filter}).` }] };
+        const lines = result.rooms.map((r) => {
+          const parts = [`#${r.name}  ID: ${r.id}  Members: ${r.member_count}`];
+          if (r.topic) parts.push(`  Topic: ${r.topic}`);
+          if (r.last_message_at) parts.push(`  Last message: ${r.last_message_at}`);
+          return parts.join("\n");
+        });
+        return { content: [{ type: "text" as const, text: lines.join("\n\n") }] };
+      } catch (e) {
+        return { content: [{ type: "text" as const, text: `Error: ${e instanceof Error ? e.message : String(e)}` }], isError: true };
+      }
+    }
+
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
@@ -406,33 +547,28 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // Poll DMs and room messages in parallel
+    const [dmResult, roomResult] = await Promise.all([
+      brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId }),
+      brokerFetch<PollRoomMessagesResponse>("/poll-room-messages", { peer_id: myId }),
+    ]);
 
-    for (const msg of result.messages) {
-      // Look up the sender's info for context
+    // --- Direct messages ---
+    for (const msg of dmResult.messages) {
       let fromSummary = "";
       let fromCwd = "";
       try {
-        const peers = await brokerFetch<Peer[]>("/list-peers", {
-          scope: "machine",
-          cwd: myCwd,
-          git_root: myGitRoot,
-        });
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
         const sender = peers.find((p) => p.id === msg.from_id);
-        if (sender) {
-          fromSummary = sender.summary;
-          fromCwd = sender.cwd;
-        }
-      } catch {
-        // Non-critical, proceed without sender info
-      }
+        if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+      } catch { /* non-critical */ }
 
-      // Push as channel notification — this is what makes it immediate
       await mcp.notification({
         method: "notifications/claude/channel",
         params: {
           content: msg.text,
           meta: {
+            type: "direct_message",
             from_id: msg.from_id,
             from_summary: fromSummary,
             from_cwd: fromCwd,
@@ -440,11 +576,40 @@ async function pollAndPushMessages() {
           },
         },
       });
+      log(`DM from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    // --- Room messages ---
+    for (const msg of roomResult.messages) {
+      // Don't notify about our own messages
+      if (msg.from_id === myId) continue;
+
+      let fromSummary = "";
+      let fromCwd = "";
+      try {
+        const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+        const sender = peers.find((p) => p.id === msg.from_id);
+        if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+      } catch { /* non-critical */ }
+
+      await mcp.notification({
+        method: "notifications/claude/channel",
+        params: {
+          content: `[#${msg.room_name}] ${msg.text}`,
+          meta: {
+            type: "room_message",
+            room_id: msg.room_id,
+            room_name: msg.room_name,
+            from_id: msg.from_id,
+            from_summary: fromSummary,
+            from_cwd: fromCwd,
+            sent_at: msg.sent_at,
+          },
+        },
+      });
+      log(`Room #${msg.room_name} from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
     }
   } catch (e) {
-    // Broker might be down temporarily, don't crash
     log(`Poll error: ${e instanceof Error ? e.message : String(e)}`);
   }
 }

@@ -1,5 +1,6 @@
 // Unique ID for each Claude Code instance (generated on registration)
 export type PeerId = string;
+export type RoomId = string;
 
 export interface Peer {
   id: PeerId;
@@ -65,3 +66,39 @@ export interface PollMessagesRequest {
 export interface PollMessagesResponse {
   messages: Message[];
 }
+
+// --- Room types ---
+
+export interface Room {
+  id: RoomId;
+  name: string;
+  topic: string;
+  created_by: PeerId;
+  created_at: string;
+}
+
+export interface RoomWithMeta extends Room {
+  member_count: number;
+  last_message_at: string | null;
+}
+
+export interface RoomMessage {
+  id: number;
+  room_id: RoomId;
+  room_name: string;
+  from_id: PeerId;
+  text: string;
+  sent_at: string;
+}
+
+export interface CreateRoomRequest { peer_id: PeerId; name: string; topic?: string; }
+export interface CreateRoomResponse { ok: boolean; room?: Room; error?: string; }
+export interface JoinRoomRequest { peer_id: PeerId; room_name: string; }
+export interface JoinRoomResponse { ok: boolean; room?: Room; error?: string; }
+export interface LeaveRoomRequest { peer_id: PeerId; room_id: RoomId; }
+export interface PostToRoomRequest { from_id: PeerId; room_id: RoomId; text: string; }
+export interface PostToRoomResponse { ok: boolean; message_id?: number; error?: string; }
+export interface ListRoomsRequest { peer_id?: PeerId; }
+export interface ListRoomsResponse { rooms: RoomWithMeta[]; }
+export interface PollRoomMessagesRequest { peer_id: PeerId; }
+export interface PollRoomMessagesResponse { messages: RoomMessage[]; }
