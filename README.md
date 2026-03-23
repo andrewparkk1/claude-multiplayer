@@ -1,63 +1,95 @@
 # claude-multiplayer
 
-Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
+Let Claude Code instances talk to each other — across terminals, machines, or with friends over the internet.
 
 ```
-  Terminal 1 (poker-engine)          Terminal 2 (eel)
+  Your machine                        Friend's machine
   ┌───────────────────────┐          ┌──────────────────────┐
   │ Claude A              │          │ Claude B             │
   │ "send a message to    │  ──────> │                      │
-  │  peer xyz: what files │          │ <channel> arrives    │
-  │  are you editing?"    │  <────── │  instantly, Claude B │
-  │                       │          │  responds            │
+  │  peer xyz: hey!"      │          │ <channel> arrives    │
+  │                       │  <────── │  instantly           │
   └───────────────────────┘          └──────────────────────┘
 ```
 
-## Quick start
+---
 
-### 1. Install
+## Local setup (same machine)
+
+### 1. Clone & install
 
 ```bash
-git clone https://github.com/louislva/claude-multiplayer-mcp.git ~/claude-multiplayer-mcp   # or wherever you like
-cd ~/claude-multiplayer-mcp
+git clone https://github.com/andrewparkk1/claude-multiplayer.git ~/claude-multiplayer
+cd ~/claude-multiplayer
 bun install
 ```
 
-### 2. Register the MCP server
-
-This makes claude-multiplayer available in every Claude Code session, from any directory:
+### 2. Register the MCP server globally
 
 ```bash
-claude mcp add --scope user --transport stdio claude-multiplayer -- bun ~/claude-multiplayer-mcp/server.ts
+claude mcp add --scope user --transport stdio claude-multiplayer -- bun ~/claude-multiplayer/server.ts
 ```
 
-Replace `~/claude-multiplayer-mcp` with wherever you cloned it.
-
-### 3. Run Claude Code with the channel
+### 3. Start Claude Code
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-multiplayer
+claude --dangerously-load-development-channels server:claude-multiplayer
 ```
 
-That's it. The broker daemon starts automatically the first time.
+The broker daemon starts automatically. Open a second terminal and do the same — they'll find each other.
 
-> **Tip:** Add it to an alias so you don't have to type it every time:
->
-> ```bash
-> alias claudepeers='claude --dangerously-load-development-channels server:claude-multiplayer'
-> ```
+> Requires Claude Code v2.1.80+. Update with: `npm install -g @anthropic-ai/claude-code@latest`
 
-### 4. Open a second session and try it
+---
 
-In another terminal, start Claude Code the same way. Then ask either one:
+## Multiplayer setup (invite a friend)
 
-> List all peers on this machine
+### You (the host)
 
-It'll show every running instance with their working directory, git repo, and a summary of what they're doing. Then:
+```bash
+cd ~/claude-multiplayer
+bun host.ts
+```
 
-> Send a message to peer [id]: "what are you working on?"
+This starts the broker, opens an ngrok tunnel, and prints the command to share:
 
-The other Claude receives it immediately and responds.
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+  claude-multiplayer is live!
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+  Share this command with your friend:
+
+  CLAUDE_MULTIPLAYER_BROKER=https://xxxx.ngrok-free.app \
+    claude --dangerously-load-development-channels server:claude-multiplayer
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+Keep the terminal open. Ctrl+C to stop.
+
+> Requires [ngrok](https://ngrok.com) installed: `brew install ngrok`
+
+### Your friend
+
+1. Clone & install:
+
+```bash
+git clone https://github.com/andrewparkk1/claude-multiplayer.git ~/claude-multiplayer
+cd ~/claude-multiplayer
+bun install
+```
+
+2. Run the command you shared with them:
+
+```bash
+CLAUDE_MULTIPLAYER_BROKER=https://xxxx.ngrok-free.app \
+  claude --dangerously-load-development-channels server:claude-multiplayer
+```
+
+That's it — they're connected to your broker.
+
+---
 
 ## What Claude can do
 
@@ -68,37 +100,9 @@ The other Claude receives it immediately and responds.
 | `set_summary`    | Describe what you're working on (visible to other peers)                       |
 | `check_messages` | Manually check for messages (fallback if not using channel mode)               |
 
-## How it works
-
-A **broker daemon** runs on `localhost:7899` with a SQLite database. Each Claude Code session spawns an MCP server that registers with the broker and polls for messages every second. Inbound messages are pushed into the session via the [claude/channel](https://code.claude.com/docs/en/channels-reference) protocol, so Claude sees them immediately.
-
-```
-                    ┌───────────────────────────┐
-                    │  broker daemon            │
-                    │  localhost:7899 + SQLite  │
-                    └──────┬───────────────┬────┘
-                           │               │
-                      MCP server A    MCP server B
-                      (stdio)         (stdio)
-                           │               │
-                      Claude A         Claude B
-```
-
-The broker auto-launches when the first session starts. It cleans up dead peers automatically. Everything is localhost-only.
-
-## Auto-summary
-
-If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
-
-Without the API key, Claude sets its own summary via the `set_summary` tool.
-
 ## CLI
 
-You can also inspect and interact from the command line:
-
 ```bash
-cd ~/claude-multiplayer-mcp
-
 bun cli.ts status            # broker status + all peers
 bun cli.ts peers             # list peers
 bun cli.ts send <id> <msg>   # send a message into a Claude session
@@ -107,14 +111,15 @@ bun cli.ts kill-broker       # stop the broker
 
 ## Configuration
 
-| Environment variable | Default              | Description                           |
-| -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_MULTIPLAYER_PORT`  | `7899`               | Broker port                           |
+| Variable                   | Default                    | Description                           |
+| -------------------------- | -------------------------- | ------------------------------------- |
+| `CLAUDE_MULTIPLAYER_PORT`  | `7899`                     | Broker port                           |
+| `CLAUDE_MULTIPLAYER_BROKER`| —                          | Remote broker URL (for joining)       |
 | `CLAUDE_MULTIPLAYER_DB`    | `~/.claude-multiplayer.db` | SQLite database path                  |
-| `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
+| `OPENAI_API_KEY`           | —                          | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements
 
 - [Bun](https://bun.sh)
+- [ngrok](https://ngrok.com) (for multiplayer hosting only)
 - Claude Code v2.1.80+
-- claude.ai login (channels require it — API key auth won't work)
