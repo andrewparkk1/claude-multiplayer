@@ -1,4 +1,4 @@
-# claude-peers
+# claude-multiplayer
 
 Let your Claude Code instances find each other and talk. When you're running 5 sessions across different projects, any Claude can discover the others and send messages that arrive instantly.
 
@@ -18,25 +18,25 @@ Let your Claude Code instances find each other and talk. When you're running 5 s
 ### 1. Install
 
 ```bash
-git clone https://github.com/louislva/claude-peers-mcp.git ~/claude-peers-mcp   # or wherever you like
-cd ~/claude-peers-mcp
+git clone https://github.com/louislva/claude-multiplayer-mcp.git ~/claude-multiplayer-mcp   # or wherever you like
+cd ~/claude-multiplayer-mcp
 bun install
 ```
 
 ### 2. Register the MCP server
 
-This makes claude-peers available in every Claude Code session, from any directory:
+This makes claude-multiplayer available in every Claude Code session, from any directory:
 
 ```bash
-claude mcp add --scope user --transport stdio claude-peers -- bun ~/claude-peers-mcp/server.ts
+claude mcp add --scope user --transport stdio claude-multiplayer -- bun ~/claude-multiplayer-mcp/server.ts
 ```
 
-Replace `~/claude-peers-mcp` with wherever you cloned it.
+Replace `~/claude-multiplayer-mcp` with wherever you cloned it.
 
 ### 3. Run Claude Code with the channel
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-peers
+claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-multiplayer
 ```
 
 That's it. The broker daemon starts automatically the first time.
@@ -44,7 +44,7 @@ That's it. The broker daemon starts automatically the first time.
 > **Tip:** Add it to an alias so you don't have to type it every time:
 >
 > ```bash
-> alias claudepeers='claude --dangerously-load-development-channels server:claude-peers'
+> alias claudepeers='claude --dangerously-load-development-channels server:claude-multiplayer'
 > ```
 
 ### 4. Open a second session and try it
@@ -97,7 +97,7 @@ Without the API key, Claude sets its own summary via the `set_summary` tool.
 You can also inspect and interact from the command line:
 
 ```bash
-cd ~/claude-peers-mcp
+cd ~/claude-multiplayer-mcp
 
 bun cli.ts status            # broker status + all peers
 bun cli.ts peers             # list peers
@@ -109,8 +109,8 @@ bun cli.ts kill-broker       # stop the broker
 
 | Environment variable | Default              | Description                           |
 | -------------------- | -------------------- | ------------------------------------- |
-| `CLAUDE_PEERS_PORT`  | `7899`               | Broker port                           |
-| `CLAUDE_PEERS_DB`    | `~/.claude-peers.db` | SQLite database path                  |
+| `CLAUDE_MULTIPLAYER_PORT`  | `7899`               | Broker port                           |
+| `CLAUDE_MULTIPLAYER_DB`    | `~/.claude-multiplayer.db` | SQLite database path                  |
 | `OPENAI_API_KEY`     | —                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements

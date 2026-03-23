@@ -1,6 +1,6 @@
 {
   "mcpServers": {
-    "claude-peers": {
+    "claude-multiplayer": {
       "command": "bun",
       "args": ["./server.ts"]
     }

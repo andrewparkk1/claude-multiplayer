@@ -4,7 +4,7 @@ globs: "*.ts, *.tsx, *.html, *.css, *.js, *.jsx, package.json"
 alwaysApply: false
 ---
 
-# claude-peers
+# claude-multiplayer
 
 Peer discovery and messaging MCP channel for Claude Code instances.
 
@@ -20,10 +20,10 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ```bash
 # Start Claude Code with the channel:
-claude --dangerously-load-development-channels server:claude-peers
+claude --dangerously-load-development-channels server:claude-multiplayer
 
 # Or just add to .mcp.json and use as regular MCP (no channel push, but tools work):
-# { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+# { "claude-multiplayer": { "command": "bun", "args": ["./server.ts"] } }
 
 # CLI:
 bun cli.ts status

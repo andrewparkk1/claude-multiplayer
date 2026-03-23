@@ -1,6 +1,6 @@
 #!/usr/bin/env bun
 /**
- * claude-peers CLI
+ * claude-multiplayer CLI
  *
  * Utility commands for managing the broker and inspecting peers.
  *
@@ -11,8 +11,8 @@
  *   bun cli.ts kill-broker     — Stop the broker daemon
  */
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_PORT = parseInt(process.env.CLAUDE_MULTIPLAYER_PORT ?? "7899", 10);
+const BROKER_URL = process.env.CLAUDE_MULTIPLAYER_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
 
 async function brokerFetch<T>(path: string, body?: unknown): Promise<T> {
   const opts: RequestInit = body
@@ -151,7 +151,7 @@ switch (cmd) {
   }
 
   default:
-    console.log(`claude-peers CLI
+    console.log(`claude-multiplayer CLI
 
 Usage:
   bun cli.ts status          Show broker status and all peers

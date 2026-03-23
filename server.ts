@@ -1,16 +1,16 @@
 #!/usr/bin/env bun
 /**
- * claude-peers MCP server
+ * claude-multiplayer MCP server
  *
  * Spawned by Claude Code as a stdio MCP server (one per instance).
  * Connects to the shared broker daemon for peer discovery and messaging.
  * Declares claude/channel capability to push inbound messages immediately.
  *
  * Usage:
- *   claude --dangerously-load-development-channels server:claude-peers
+ *   claude --dangerously-load-development-channels server:claude-multiplayer
  *
  * With .mcp.json:
- *   { "claude-peers": { "command": "bun", "args": ["./server.ts"] } }
+ *   { "claude-multiplayer": { "command": "bun", "args": ["./server.ts"] } }
  */
 
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -34,8 +34,9 @@ import {
 
 // --- Configuration ---
 
-const BROKER_PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
-const BROKER_URL = `http://127.0.0.1:${BROKER_PORT}`;
+const BROKER_PORT = parseInt(process.env.CLAUDE_MULTIPLAYER_PORT ?? "7899", 10);
+const BROKER_URL = process.env.CLAUDE_MULTIPLAYER_BROKER ?? `http://127.0.0.1:${BROKER_PORT}`;
+const IS_REMOTE = !!process.env.CLAUDE_MULTIPLAYER_BROKER;
 const POLL_INTERVAL_MS = 1000;
 const HEARTBEAT_INTERVAL_MS = 15_000;
 const BROKER_SCRIPT = new URL("./broker.ts", import.meta.url).pathname;
@@ -95,7 +96,7 @@ async function ensureBroker(): Promise<void> {
 
 function log(msg: string) {
   // MCP stdio servers must only use stderr for logging (stdout is the MCP protocol)
-  console.error(`[claude-peers] ${msg}`);
+  console.error(`[claude-multiplayer] ${msg}`);
 }
 
 async function getGitRoot(cwd: string): Promise<string | null> {
@@ -142,15 +143,15 @@ let myGitRoot: string | null = null;
 // --- MCP Server ---
 
 const mcp = new Server(
-  { name: "claude-peers", version: "0.1.0" },
+  { name: "claude-multiplayer", version: "0.1.0" },
   {
     capabilities: {
       experimental: { "claude/channel": {} },
       tools: {},
     },
-    instructions: `You are connected to the claude-peers network. Other Claude Code instances on this machine can see you and send you messages.
+    instructions: `You are connected to the claude-multiplayer network. Other Claude Code instances on this machine can see you and send you messages.
 
-IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
+IMPORTANT: When you receive a <channel source="claude-multiplayer" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
 Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
 
@@ -451,8 +452,15 @@ async function pollAndPushMessages() {
 // --- Startup ---
 
 async function main() {
-  // 1. Ensure broker is running
-  await ensureBroker();
+  // 1. Ensure broker is running (skip auto-launch for remote brokers)
+  if (IS_REMOTE) {
+    if (!(await isBrokerAlive())) {
+      throw new Error(`Remote broker at ${BROKER_URL} is not reachable`);
+    }
+    log(`Connected to remote broker at ${BROKER_URL}`);
+  } else {
+    await ensureBroker();
+  }
 
   // 2. Gather context
   myCwd = process.cwd();
@@ -487,9 +495,9 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker (pid=0 for remote so broker uses heartbeat-only liveness)
   const reg = await brokerFetch<RegisterResponse>("/register", {
-    pid: process.pid,
+    pid: IS_REMOTE ? 0 : process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,

@@ -1,5 +1,5 @@
 /**
- * claude-peers
+ * claude-multiplayer
  *
  * Peer discovery and messaging for Claude Code instances.
  *
