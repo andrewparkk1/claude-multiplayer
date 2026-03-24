@@ -2,6 +2,8 @@
 export type PeerId = string;
 export type RoomId = string;
 
+export type PeerStatus = "online" | "idle" | "busy";
+
 export interface Peer {
   id: PeerId;
   name: string;
@@ -10,6 +12,8 @@ export interface Peer {
   git_root: string | null;
   tty: string | null;
   summary: string;
+  status: PeerStatus;
+  status_updated_at: string; // ISO timestamp
   registered_at: string; // ISO timestamp
   last_seen: string; // ISO timestamp
 }
@@ -45,6 +49,11 @@ export interface HeartbeatRequest {
 export interface SetSummaryRequest {
   id: PeerId;
   summary: string;
+}
+
+export interface SetStatusRequest {
+  id: PeerId;
+  status: PeerStatus;
 }
 
 export interface ListPeersRequest {

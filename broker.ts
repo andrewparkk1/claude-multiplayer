@@ -16,11 +16,13 @@ import type {
   RegisterResponse,
   HeartbeatRequest,
   SetSummaryRequest,
+  SetStatusRequest,
   ListPeersRequest,
   SendMessageRequest,
   PollMessagesRequest,
   PollMessagesResponse,
   Peer,
+  PeerStatus,
   Message,
   Room,
   RoomWithMeta,
@@ -64,10 +66,18 @@ db.run(`
     git_root TEXT,
     tty TEXT,
     summary TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'online',
+    status_updated_at TEXT NOT NULL DEFAULT '',
     registered_at TEXT NOT NULL,
     last_seen TEXT NOT NULL
   )
 `);
+
+// Migrate: add status columns if missing (existing DBs)
+try {
+  db.run("ALTER TABLE peers ADD COLUMN status TEXT NOT NULL DEFAULT 'online'");
+  db.run("ALTER TABLE peers ADD COLUMN status_updated_at TEXT NOT NULL DEFAULT ''");
+} catch { /* columns already exist */ }
 
 db.run(`
   CREATE TABLE IF NOT EXISTS messages (
@@ -166,8 +176,8 @@ setInterval(() => {
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, status, status_updated_at, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
 
 function peerLabel(id: string): string {
@@ -181,6 +191,10 @@ const updateLastSeen = db.prepare(`
 
 const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
+`);
+
+const updateStatus = db.prepare(`
+  UPDATE peers SET status = ?, status_updated_at = ? WHERE id = ?
 `);
 
 const deletePeer = db.prepare(`
@@ -235,7 +249,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.name ?? "", body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.name ?? "", body.pid, body.cwd, body.git_root, body.tty, body.summary, "online", now, now, now);
   const displayName = body.name ? `${body.name} (${id})` : id;
   logActivity("🟢", `peer joined: ${displayName} — ${body.cwd}`);
   return { id };
@@ -247,6 +261,32 @@ function handleHeartbeat(body: HeartbeatRequest): void {
 
 function handleSetSummary(body: SetSummaryRequest): void {
   updateSummary.run(body.summary, body.id);
+}
+
+function handleSetStatus(body: SetStatusRequest): void {
+  const now = new Date().toISOString();
+  updateStatus.run(body.status, now, body.id);
+  logActivity("🔵", `${peerLabel(body.id)} status → ${body.status}`);
+
+  // Broadcast presence change to all rooms this peer is in
+  const memberships = db.query("SELECT room_id FROM room_members WHERE peer_id = ?")
+    .all(body.id) as { room_id: string }[];
+
+  for (const { room_id } of memberships) {
+    const members = db.query("SELECT peer_id FROM room_members WHERE room_id = ?")
+      .all(room_id) as { peer_id: string }[];
+    const payload = {
+      type: "presence",
+      peer_id: body.id,
+      status: body.status,
+      updated_at: now,
+      room_id,
+    };
+    for (const { peer_id } of members) {
+      if (peer_id === body.id) continue;
+      wsPush(peer_id, payload);
+    }
+  }
 }
 
 function handleListPeers(body: ListPeersRequest): Peer[] {
@@ -306,8 +346,7 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   const now = new Date().toISOString();
   const result = insertMessage.run(body.from_id, body.to_id, body.text, now);
   const msgId = result.lastInsertRowid as number;
-  const preview = body.text.length > 80 ? body.text.slice(0, 80) + "…" : body.text;
-  logActivity("💬", `DM ${peerLabel(body.from_id)} → ${peerLabel(body.to_id)}: ${preview}`);
+  logActivity("💬", `DM ${peerLabel(body.from_id)} → ${peerLabel(body.to_id)}: ${body.text}`);
 
   // Push over WebSocket immediately if target is connected
   const pushed = wsPush(body.to_id, {
@@ -391,8 +430,7 @@ function handlePostToRoom(body: PostToRoomRequest): PostToRoomResponse {
 
   // Get room name and all members for push
   const room = db.query("SELECT name FROM rooms WHERE id = ?").get(body.room_id) as { name: string } | null;
-  const roomPreview = body.text.length > 80 ? body.text.slice(0, 80) + "…" : body.text;
-  logActivity("💬", `#${room?.name ?? body.room_id} ${peerLabel(body.from_id)}: ${roomPreview}`);
+  logActivity("💬", `#${room?.name ?? body.room_id} ${peerLabel(body.from_id)}: ${body.text}`);
   const members = db.query("SELECT peer_id FROM room_members WHERE room_id = ?")
     .all(body.room_id) as { peer_id: string }[];
 
@@ -521,6 +559,9 @@ Bun.serve<WSData>({
           return Response.json({ ok: true });
         case "/set-summary":
           handleSetSummary(body as SetSummaryRequest);
+          return Response.json({ ok: true });
+        case "/set-status":
+          handleSetStatus(body as SetStatusRequest);
           return Response.json({ ok: true });
         case "/list-peers":
           return Response.json(handleListPeers(body as ListPeersRequest));

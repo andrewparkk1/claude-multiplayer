@@ -247,6 +247,22 @@ const TOOLS = [
     },
   },
   {
+    name: "set_status",
+    description:
+      "Set your presence status. Visible to other peers and broadcast to rooms you're in.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        status: {
+          type: "string" as const,
+          enum: ["online", "idle", "busy"],
+          description: 'Your presence status: "online" (active), "idle" (not actively working), "busy" (focused, prefer not to be interrupted)',
+        },
+      },
+      required: ["status"],
+    },
+  },
+  {
     name: "check_messages",
     description:
       "Manually check for new messages from other Claude Code instances. Messages are normally pushed automatically via channel notifications, but you can use this as a fallback.",
@@ -348,16 +364,17 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
           };
         }
 
+        const statusEmoji = (s: string) => s === "online" ? "🟢" : s === "idle" ? "🟡" : s === "busy" ? "🔴" : "⚪";
         const lines = peers.map((p) => {
           const parts = [
-            `ID: ${p.id}`,
-            ...(p.name ? [`Name: ${p.name}`] : []),
-            `CWD: ${p.cwd}`,
+            `${statusEmoji(p.status ?? "online")} ${p.name || p.id} (${p.status ?? "online"})`,
+            `  ID: ${p.id}`,
+            `  CWD: ${p.cwd}`,
           ];
-          if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.summary) parts.push(`Summary: ${p.summary}`);
-          parts.push(`Last seen: ${p.last_seen}`);
-          return parts.join("\n  ");
+          if (p.git_root) parts.push(`  Repo: ${p.git_root}`);
+          if (p.summary) parts.push(`  Summary: ${p.summary}`);
+          parts.push(`  Last seen: ${p.last_seen}`);
+          return parts.join("\n");
         });
 
         return {
@@ -436,6 +453,33 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             {
               type: "text" as const,
               text: `Error setting summary: ${e instanceof Error ? e.message : String(e)}`,
+            },
+          ],
+          isError: true,
+        };
+      }
+    }
+
+    case "set_status": {
+      const { status } = args as { status: "online" | "idle" | "busy" };
+      if (!myId) {
+        return {
+          content: [{ type: "text" as const, text: "Not registered with broker yet" }],
+          isError: true,
+        };
+      }
+      try {
+        await brokerFetch("/set-status", { id: myId, status });
+        const emoji = status === "online" ? "🟢" : status === "idle" ? "🟡" : "🔴";
+        return {
+          content: [{ type: "text" as const, text: `${emoji} Status set to: ${status}` }],
+        };
+      } catch (e) {
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: `Error setting status: ${e instanceof Error ? e.message : String(e)}`,
             },
           ],
           isError: true,
@@ -566,11 +610,11 @@ async function pushDm(msg: { id: number; from_id: string; to_id: string; text: s
   await mcp.notification({
     method: "notifications/claude/channel",
     params: {
-      content: msg.text,
+      content: `[DM from ${label}] ${msg.text}`,
       meta: { type: "direct_message", from_id: msg.from_id, from_name: fromName, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
     },
   });
-  log(`DM from ${label}: ${msg.text.slice(0, 80)}`);
+  log(`DM from ${label}: ${msg.text}`);
 }
 
 async function pushRoomMessage(msg: RoomMessage) {
@@ -587,11 +631,33 @@ async function pushRoomMessage(msg: RoomMessage) {
   await mcp.notification({
     method: "notifications/claude/channel",
     params: {
-      content: `[#${msg.room_name}] ${msg.text}`,
+      content: `[#${msg.room_name}] ${label}: ${msg.text}`,
       meta: { type: "room_message", room_id: msg.room_id, room_name: msg.room_name, from_id: msg.from_id, from_name: fromName, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
     },
   });
-  log(`Room #${msg.room_name} from ${label}: ${msg.text.slice(0, 80)}`);
+  log(`Room #${msg.room_name} from ${label}: ${msg.text}`);
+}
+
+async function pushPresenceChange(data: { peer_id: string; status: string; room_id: string; updated_at: string }) {
+  if (data.peer_id === myId) return;
+
+  let peerName = "";
+  try {
+    const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
+    const peer = peers.find((p) => p.id === data.peer_id);
+    if (peer) peerName = peer.name;
+  } catch { /* non-critical */ }
+
+  const label = peerName ? `${peerName} (${data.peer_id})` : data.peer_id;
+  const emoji = data.status === "online" ? "🟢" : data.status === "idle" ? "🟡" : "🔴";
+  await mcp.notification({
+    method: "notifications/claude/channel",
+    params: {
+      content: `${emoji} ${label} is now ${data.status}`,
+      meta: { type: "presence_change", peer_id: data.peer_id, status: data.status, room_id: data.room_id, updated_at: data.updated_at },
+    },
+  });
+  log(`Presence: ${label} → ${data.status}`);
 }
 
 // --- WebSocket connection to broker ---
@@ -620,6 +686,8 @@ function connectBrokerWs() {
         await pushDm(data.message);
       } else if (data.type === "room_message") {
         await pushRoomMessage(data.message);
+      } else if (data.type === "presence") {
+        await pushPresenceChange(data);
       }
     } catch (e) {
       log(`WS message error: ${e instanceof Error ? e.message : String(e)}`);
