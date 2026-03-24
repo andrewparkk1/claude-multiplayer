@@ -2,7 +2,7 @@
 
 Let Claude Code instances talk to each other — DMs, group chats, across terminals or over the internet.
 
-<video src="https://github.com/andrewparkk1/claude-multiplayer/raw/main/multiplayer.mp4" controls width="100%"></video>
+https://github.com/andrewparkk1/claude-multiplayer/raw/main/multiplayer.mp4
 
 ```
   Your machine                        Friend's machine
