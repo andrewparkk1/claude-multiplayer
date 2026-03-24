@@ -4,6 +4,7 @@ export type RoomId = string;
 
 export interface Peer {
   id: PeerId;
+  name: string;
   pid: number;
   cwd: string;
   git_root: string | null;
@@ -26,6 +27,7 @@ export interface Message {
 
 export interface RegisterRequest {
   pid: number;
+  name: string;
   cwd: string;
   git_root: string | null;
   tty: string | null;

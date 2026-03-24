@@ -42,6 +42,13 @@ const PORT = parseInt(process.env.CLAUDE_MULTIPLAYER_PORT ?? "7899", 10);
 const HOST = process.env.CLAUDE_MULTIPLAYER_HOST ?? "0.0.0.0";
 const DB_PATH = process.env.CLAUDE_MULTIPLAYER_DB ?? `${process.env.HOME}/.claude-multiplayer.db`;
 
+// --- Activity logging ---
+
+function logActivity(icon: string, msg: string) {
+  const time = new Date().toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
+  console.error(`  ${time}  ${icon}  ${msg}`);
+}
+
 // --- Database setup ---
 
 const db = new Database(DB_PATH);
@@ -51,6 +58,7 @@ db.run("PRAGMA busy_timeout = 3000");
 db.run(`
   CREATE TABLE IF NOT EXISTS peers (
     id TEXT PRIMARY KEY,
+    name TEXT NOT NULL DEFAULT '',
     pid INTEGER NOT NULL,
     cwd TEXT NOT NULL,
     git_root TEXT,
@@ -125,22 +133,47 @@ function cleanStalePeers() {
     if (peer.pid === 0 && now - lastSeen < STALE_TIMEOUT_MS) {
       continue; // remote peer still fresh
     }
+    logActivity("🔴", `stale peer removed: ${peer.id}`);
     db.run("DELETE FROM peers WHERE id = ?", [peer.id]);
     db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [peer.id]);
+    db.run("DELETE FROM room_members WHERE peer_id = ?", [peer.id]);
+  }
+}
+
+function cleanEmptyRooms() {
+  const emptyRooms = db.query(`
+    SELECT r.id, r.name FROM rooms r
+    LEFT JOIN room_members rm ON rm.room_id = r.id
+    GROUP BY r.id
+    HAVING COUNT(rm.peer_id) = 0
+  `).all() as { id: string; name: string }[];
+  for (const room of emptyRooms) {
+    logActivity("🗑️", `empty room deleted: #${room.name}`);
+    db.run("DELETE FROM room_messages WHERE room_id = ?", [room.id]);
+    db.run("DELETE FROM rooms WHERE id = ?", [room.id]);
   }
 }
 
 cleanStalePeers();
+cleanEmptyRooms();
 
-// Periodically clean stale peers (every 30s)
-setInterval(cleanStalePeers, 30_000);
+// Periodically clean stale peers and empty rooms (every 30s)
+setInterval(() => {
+  cleanStalePeers();
+  cleanEmptyRooms();
+}, 30_000);
 
 // --- Prepared statements ---
 
 const insertPeer = db.prepare(`
-  INSERT INTO peers (id, pid, cwd, git_root, tty, summary, registered_at, last_seen)
-  VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  INSERT INTO peers (id, name, pid, cwd, git_root, tty, summary, registered_at, last_seen)
+  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 `);
+
+function peerLabel(id: string): string {
+  const row = db.query("SELECT name FROM peers WHERE id = ?").get(id) as { name: string } | null;
+  return row?.name ? `${row.name} (${id})` : id;
+}
 
 const updateLastSeen = db.prepare(`
   UPDATE peers SET last_seen = ? WHERE id = ?
@@ -202,7 +235,9 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     deletePeer.run(existing.id);
   }
 
-  insertPeer.run(id, body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  insertPeer.run(id, body.name ?? "", body.pid, body.cwd, body.git_root, body.tty, body.summary, now, now);
+  const displayName = body.name ? `${body.name} (${id})` : id;
+  logActivity("🟢", `peer joined: ${displayName} — ${body.cwd}`);
   return { id };
 }
 
@@ -271,6 +306,8 @@ function handleSendMessage(body: SendMessageRequest): { ok: boolean; error?: str
   const now = new Date().toISOString();
   const result = insertMessage.run(body.from_id, body.to_id, body.text, now);
   const msgId = result.lastInsertRowid as number;
+  const preview = body.text.length > 80 ? body.text.slice(0, 80) + "…" : body.text;
+  logActivity("💬", `DM ${peerLabel(body.from_id)} → ${peerLabel(body.to_id)}: ${preview}`);
 
   // Push over WebSocket immediately if target is connected
   const pushed = wsPush(body.to_id, {
@@ -295,6 +332,7 @@ function handlePollMessages(body: PollMessagesRequest): PollMessagesResponse {
 }
 
 function handleUnregister(body: { id: string }): void {
+  logActivity("🔴", `peer left: ${body.id}`);
   deletePeer.run(body.id);
 }
 
@@ -315,6 +353,7 @@ function handleCreateRoom(body: CreateRoomRequest): CreateRoomResponse {
     [id, body.peer_id, now]);
 
   const room = db.query("SELECT * FROM rooms WHERE id = ?").get(id) as Room;
+  logActivity("🏠", `room created: #${body.name} by ${body.peer_id}`);
   return { ok: true, room };
 }
 
@@ -329,6 +368,7 @@ function handleJoinRoom(body: JoinRoomRequest): JoinRoomResponse {
   db.run("INSERT INTO room_members (room_id, peer_id, joined_at, last_read_id) VALUES (?, ?, ?, ?)",
     [room.id, body.peer_id, new Date().toISOString(), maxId]);
 
+  logActivity("📥", `${peerLabel(body.peer_id)} joined #${body.room_name}`);
   return { ok: true, room };
 }
 
@@ -351,6 +391,8 @@ function handlePostToRoom(body: PostToRoomRequest): PostToRoomResponse {
 
   // Get room name and all members for push
   const room = db.query("SELECT name FROM rooms WHERE id = ?").get(body.room_id) as { name: string } | null;
+  const roomPreview = body.text.length > 80 ? body.text.slice(0, 80) + "…" : body.text;
+  logActivity("💬", `#${room?.name ?? body.room_id} ${peerLabel(body.from_id)}: ${roomPreview}`);
   const members = db.query("SELECT peer_id FROM room_members WHERE room_id = ?")
     .all(body.room_id) as { peer_id: string }[];
 
@@ -520,12 +562,16 @@ Bun.serve<WSData>({
         if (msg.type === "auth" && msg.peer_id) {
           ws.data.peerId = msg.peer_id;
           wsClients.set(msg.peer_id, ws);
+          logActivity("⚡", `WebSocket connected: ${peerLabel(msg.peer_id)}`);
           ws.send(JSON.stringify({ type: "auth_ok", peer_id: msg.peer_id }));
         }
       } catch { /* ignore malformed */ }
     },
     close(ws) {
-      if (ws.data?.peerId) wsClients.delete(ws.data.peerId);
+      if (ws.data?.peerId) {
+        logActivity("⚡", `WebSocket disconnected: ${peerLabel(ws.data.peerId)}`);
+        wsClients.delete(ws.data.peerId);
+      }
     },
   },
 });

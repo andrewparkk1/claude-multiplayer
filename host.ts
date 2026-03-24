@@ -98,7 +98,7 @@ console.log("");
 console.log("  Share this command with your friend:");
 console.log("");
 console.log(`  CLAUDE_MULTIPLAYER_BROKER=${publicUrl} \\`);
-console.log(`    claude --dangerously-load-development-channels server:claude-multiplayer`);
+console.log(`    claude --dangerously-skip-permissions --dangerously-load-development-channels server:claude-multiplayer`);
 console.log("");
 console.log("  Your broker URL:");
 console.log(`  ${publicUrl}`);
@@ -109,9 +109,30 @@ console.log("━━━━━━━━━━━━━━━━━━━━━━�
 console.log("");
 
 // Keep process alive so ngrok stays up
-process.on("SIGINT", () => {
+process.on("SIGINT", async () => {
   console.log("\nShutting down...");
+
+  // Kill ngrok
   Bun.spawnSync(["pkill", "-f", `ngrok http ${PORT}`]);
+
+  // Kill the broker
+  const kill = Bun.spawnSync(["lsof", "-ti", `:${PORT}`]);
+  const pids = new TextDecoder().decode(kill.stdout).trim().split("\n").filter(Boolean);
+  for (const pid of pids) {
+    try { process.kill(parseInt(pid), "SIGTERM"); } catch {}
+  }
+  if (pids.length) log("Broker stopped");
+
+  // Delete the database so next session starts clean
+  const DB_PATH = process.env.CLAUDE_MULTIPLAYER_DB ?? `${process.env.HOME}/.claude-multiplayer.db`;
+  try {
+    const { unlinkSync } = await import("node:fs");
+    unlinkSync(DB_PATH);
+    try { unlinkSync(DB_PATH + "-wal"); } catch {}
+    try { unlinkSync(DB_PATH + "-shm"); } catch {}
+    log("Database cleared");
+  } catch {}
+
   process.exit(0);
 });
 

@@ -143,8 +143,19 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+let myName: string = "";
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
+
+async function getGitUserName(): Promise<string> {
+  try {
+    const proc = Bun.spawn(["git", "config", "user.name"], { stdout: "pipe", stderr: "ignore" });
+    const text = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    if (code === 0) return text.trim();
+  } catch {}
+  return "";
+}
 
 // --- MCP Server ---
 
@@ -340,11 +351,10 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
-            `PID: ${p.pid}`,
+            ...(p.name ? [`Name: ${p.name}`] : []),
             `CWD: ${p.cwd}`,
           ];
           if (p.git_root) parts.push(`Repo: ${p.git_root}`);
-          if (p.tty) parts.push(`TTY: ${p.tty}`);
           if (p.summary) parts.push(`Summary: ${p.summary}`);
           parts.push(`Last seen: ${p.last_seen}`);
           return parts.join("\n  ");
@@ -545,41 +555,43 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
 // --- Notification helpers ---
 
 async function pushDm(msg: { id: number; from_id: string; to_id: string; text: string; sent_at: string }) {
-  let fromSummary = "", fromCwd = "";
+  let fromName = "", fromSummary = "", fromCwd = "";
   try {
     const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
     const sender = peers.find((p) => p.id === msg.from_id);
-    if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+    if (sender) { fromName = sender.name; fromSummary = sender.summary; fromCwd = sender.cwd; }
   } catch { /* non-critical */ }
 
+  const label = fromName ? `${fromName} (${msg.from_id})` : msg.from_id;
   await mcp.notification({
     method: "notifications/claude/channel",
     params: {
       content: msg.text,
-      meta: { type: "direct_message", from_id: msg.from_id, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
+      meta: { type: "direct_message", from_id: msg.from_id, from_name: fromName, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
     },
   });
-  log(`DM from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+  log(`DM from ${label}: ${msg.text.slice(0, 80)}`);
 }
 
 async function pushRoomMessage(msg: RoomMessage) {
   if (msg.from_id === myId) return; // don't echo own messages
 
-  let fromSummary = "", fromCwd = "";
+  let fromName = "", fromSummary = "", fromCwd = "";
   try {
     const peers = await brokerFetch<Peer[]>("/list-peers", { scope: "machine", cwd: myCwd, git_root: myGitRoot });
     const sender = peers.find((p) => p.id === msg.from_id);
-    if (sender) { fromSummary = sender.summary; fromCwd = sender.cwd; }
+    if (sender) { fromName = sender.name; fromSummary = sender.summary; fromCwd = sender.cwd; }
   } catch { /* non-critical */ }
 
+  const label = fromName ? `${fromName} (${msg.from_id})` : msg.from_id;
   await mcp.notification({
     method: "notifications/claude/channel",
     params: {
       content: `[#${msg.room_name}] ${msg.text}`,
-      meta: { type: "room_message", room_id: msg.room_id, room_name: msg.room_name, from_id: msg.from_id, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
+      meta: { type: "room_message", room_id: msg.room_id, room_name: msg.room_name, from_id: msg.from_id, from_name: fromName, from_summary: fromSummary, from_cwd: fromCwd, sent_at: msg.sent_at },
     },
   });
-  log(`Room #${msg.room_name} from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+  log(`Room #${msg.room_name} from ${label}: ${msg.text.slice(0, 80)}`);
 }
 
 // --- WebSocket connection to broker ---
@@ -686,9 +698,14 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker (pid=0 for remote so broker uses heartbeat-only liveness)
+  // 4. Detect username (env var override or git config)
+  myName = process.env.CLAUDE_MULTIPLAYER_NAME ?? await getGitUserName();
+  if (myName) log(`Username: ${myName}`);
+
+  // 5. Register with broker (pid=0 for remote so broker uses heartbeat-only liveness)
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: IS_REMOTE ? 0 : process.pid,
+    name: myName,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,

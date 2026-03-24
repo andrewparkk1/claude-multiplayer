@@ -60,9 +60,9 @@ switch (cmd) {
 
         console.log("\nPeers:");
         for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
+          const label = p.name ? `${p.name} (${p.id})` : p.id;
+          console.log(`  ${label}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
-          if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);
         }
       }
@@ -94,7 +94,8 @@ switch (cmd) {
         console.log("No peers registered.");
       } else {
         for (const p of peers) {
-          const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
+          const label = p.name ? `${p.name} (${p.id})` : p.id;
+          const parts = [`${label}  ${p.cwd}`];
           if (p.summary) parts.push(`  Summary: ${p.summary}`);
           console.log(parts.join("\n"));
         }
@@ -129,6 +130,42 @@ switch (cmd) {
     break;
   }
 
+  case "rooms": {
+    try {
+      const result = await brokerFetch<{ rooms: Array<{ id: string; name: string; topic: string; member_count: number; last_message_at: string | null }> }>("/list-rooms", {});
+      if (result.rooms.length === 0) {
+        console.log("No rooms.");
+      } else {
+        for (const r of result.rooms) {
+          console.log(`  #${r.name}  (${r.member_count} members)${r.topic ? `  — ${r.topic}` : ""}`);
+        }
+      }
+    } catch {
+      console.log("Broker is not running.");
+    }
+    break;
+  }
+
+  case "reset": {
+    const DB_PATH = process.env.CLAUDE_MULTIPLAYER_DB ?? `${process.env.HOME}/.claude-multiplayer.db`;
+    try {
+      const { unlinkSync } = await import("node:fs");
+      unlinkSync(DB_PATH);
+      // Also remove WAL/SHM files if they exist
+      try { unlinkSync(DB_PATH + "-wal"); } catch {}
+      try { unlinkSync(DB_PATH + "-shm"); } catch {}
+      console.log(`Deleted ${DB_PATH}`);
+      console.log("All peers, rooms, and messages cleared. Restart the broker to start fresh.");
+    } catch (e: any) {
+      if (e.code === "ENOENT") {
+        console.log("Database doesn't exist — already clean.");
+      } else {
+        console.error(`Error: ${e.message}`);
+      }
+    }
+    break;
+  }
+
   case "kill-broker": {
     try {
       const health = await brokerFetch<{ status: string; peers: number }>("/health");
@@ -156,6 +193,8 @@ switch (cmd) {
 Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
+  bun cli.ts rooms           List all group chat rooms
   bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts reset           Delete the database (clears all peers, rooms, messages)
   bun cli.ts kill-broker     Stop the broker daemon`);
 }
